@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dist_vfs.h"
 #include <stdio.h>
 #include <string.h>
@@ -8,17 +9,41 @@
 
 #ifdef __linux__
 // --- Linux 网络头文件 ---
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h> 
 #include <netinet/in.h> 
 #include <arpa/inet.h>  
+#include <semaphore.h>   //Linux 信号量支持
+#include <time.h>        //Linux 超时机制支持
 #else
 // --- ESP32 网络及文件系统头文件 ---
 #include "esp_vfs.h"
 #include "esp_littlefs.h"
 #include "lwip/sockets.h" // ESP32 的套接字库，和 Linux API 一样
+#include "freertos/FreeRTOS.h" 
+#include "freertos/semphr.h"   //ESP32 信号量支持
 #endif
+
+
+// ==========================================
+// ====== 同步阻塞相关的全局状态与信号量 ======
+// ==========================================
+#ifdef __linux__
+static sem_t g_sync_sem;
+#else
+static SemaphoreHandle_t g_sync_sem = NULL;
+#endif
+
+// 记录当前正在等待的远程文件状态
+static volatile int g_remote_is_waiting = 0;      // 是否正在等待
+static char g_remote_wait_path[256] = {0};        // 正在等待的远端路径
+static char g_remote_cache_path[256] = {0};       // 期望保存的本地缓存路径
+static volatile int g_remote_fetch_status = -1;   // 获取结果: 0成功, -1失败
+
+static volatile uint32_t g_remote_received_bytes = 0; // 已接收的字节数
+static volatile uint32_t g_remote_total_bytes = 0;    // 预期接收的总字节数
 
 static const char *TAG = "EDFS_VFS";
 static node_coord_t g_local_node = {1, 1};
@@ -148,11 +173,68 @@ void ssp_udp_send_packet(const ssp_frame_t *frame) {
 }
 
 
+// ==========================================================
+// ====== 【核心：同步阻塞获取远端文件】 ======
+// ==========================================================
+static int fetch_remote_file_sync(int target_i, int target_j, const char* remote_path, char* out_cache_path) {
+    // 1. 设置全局等待状态 (简单起见，V1版本我们只允许同一时刻一个线程发起远端请求)
+    g_remote_is_waiting = 1;
+    g_remote_fetch_status = -1;
+    strncpy(g_remote_wait_path, remote_path, sizeof(g_remote_wait_path) - 1);
+    
+    // 生成一个本地缓存文件的路径
+#ifdef __linux__
+    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "./sim_storage_%d_%d/.cache_remote", g_local_node.i, g_local_node.j);
+#else
+    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "%s/.cache_remote", MOUNT_POINT_PHYSICAL);
+#endif
+    strcpy(out_cache_path, g_remote_cache_path);
+
+    // 2. 打包并发送读取请求
+    ssp_frame_t frame;
+    ssp_pack_request(&frame, SSP_TYPE_READ, (uint8_t)target_i, (uint8_t)target_j, remote_path);
+    ESP_LOGI(TAG, "=> 发起同步远端读取请求，准备挂起当前线程等待数据...");
+    ssp_udp_send_packet(&frame);
+
+    // 3. 阻塞等待网络层唤醒（带有超时机制，防止死锁）
+#ifdef __linux__
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 3; // 设置 3 秒超时
+    if (sem_timedwait(&g_sync_sem, &ts) != 0) {
+        ESP_LOGE(TAG, "等待远端文件响应超时！");
+    }
+#else
+    // ESP32: 等待 3000 毫秒 (3秒)
+    if (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "等待远端文件响应超时！");
+    }
+#endif
+
+    // 4. 被唤醒或超时后，清理状态并返回结果
+    g_remote_is_waiting = 0;
+    return g_remote_fetch_status; // 如果网络层成功写入缓存，此处为 0
+}
+
 #ifndef __linux__
 // ESP32 VFS 绑定
 static int vfs_dist_open(void *ctx, const char *path, int flags, int mode) {
     char target[256];
-    resolve_path(path, target, sizeof(target));
+    int is_remote = resolve_path(path, target, sizeof(target));
+    
+    if (is_remote) {
+        int di, dj;
+        if (sscanf(target, "SSP_FORWARD:%d_%d", &di, &dj) == 2) {
+            char cache_path[256];
+            ESP_LOGI(TAG, "[VFS] 拦截到 ESP32 远程读取请求 %s", path);
+            
+            if (fetch_remote_file_sync(di, dj, path, cache_path) == 0) {
+                return open(cache_path, flags, mode);
+            } else {
+                return -1; // ESP32 VFS 失败返回 -1
+            }
+        }
+    }
     return open(target, flags, mode);
 }
 static ssize_t vfs_dist_read(void *ctx, int fd, void *dst, size_t size) { return read(fd, dst, size); }
@@ -182,16 +264,22 @@ FILE* dist_linux_fopen(const char *path, const char *mode) {
     if (is_remote) {
         int di, dj;
         if (sscanf(target, "SSP_FORWARD:%d_%d", &di, &dj) == 2) {
-            ssp_frame_t frame;
-            ssp_pack_request(&frame, SSP_TYPE_READ, (uint8_t)di, (uint8_t)dj, path);
-            printf("[%s] [远程请求] 拦截到远程路径，生成 SSP 报文:\n", TAG);
-            ssp_debug_print_frame(&frame);
-            ssp_udp_send_packet(&frame); // 发送到下一跳
+            char cache_path[256];
+            ESP_LOGI(TAG, "[VFS] 拦截到远程读取请求 %s，目标节点(%d, %d)", path, di, dj);
+            
+            // 触发同步阻塞获取
+            if (fetch_remote_file_sync(di, dj, path, cache_path) == 0) {
+                // 获取成功，直接打开本地刚刚生成的缓存文件返回给上层
+                ESP_LOGI(TAG, "[VFS] 远端文件获取完毕，将缓存文件指针移交上层");
+                return fopen(cache_path, mode);
+            } else {
+                ESP_LOGE(TAG, "[VFS] 远端文件获取失败或超时");
+                return NULL; 
+            }
         }
-        return NULL; 
     }
     
-    printf("[%s] [本地路由] %s -> %s\n", TAG, path, target);
+    //printf("[%s] [本地路由] %s -> %s\n", TAG, path, target);
     return fopen(target, mode);
 }
 
@@ -204,6 +292,14 @@ int dist_linux_fseek(FILE *stream, long offset, int whence) { return fseek(strea
 
 esp_err_t init_dist_storage_system(void)
 {
+
+// 初始化跨平台二值信号量
+#ifdef __linux__
+    sem_init(&g_sync_sem, 0, 0); // 初始值为0
+#else
+    g_sync_sem = xSemaphoreCreateBinary();
+#endif
+
 #ifdef __linux__
     char storage_dir[64];
     snprintf(storage_dir, sizeof(storage_dir), "./sim_storage_%d_%d", g_local_node.i, g_local_node.j);
@@ -353,9 +449,38 @@ static void ssp_rx_task(void* arg)
                 else if (frame->type == SSP_TYPE_RESP_DATA) {
                     ESP_LOGI(TAG, "\n================ [ 远端文件内容到达 ] ================");
                     if (frame->data_len > 0) {
-                        printf("来自卫星 (%d, %d) 的文件数据:\n%s\n", frame->src_i, frame->src_j, frame->payload);
+                        // 如果有线程正在阻塞等待，并且路径匹配（这里简化为只要在等待就接收）
+                        if (g_remote_is_waiting) {
+                            FILE *cache_f = fopen(g_remote_cache_path, "w");
+                            if (cache_f) {
+                                fwrite(frame->payload, 1, frame->data_len, cache_f);
+                                fclose(cache_f);
+                                
+                                g_remote_fetch_status = 0; // 标记成功
+                                ESP_LOGI(TAG, "远端数据已写入缓存: %s，正在唤醒应用层线程...", g_remote_cache_path);
+                                
+                                // 释放信号量，唤醒等待的 `fopen`
+                                #ifdef __linux__
+                                sem_post(&g_sync_sem);
+                                #else
+                                xSemaphoreGive(g_sync_sem);
+                                #endif
+                            } else {
+                                ESP_LOGE(TAG, "无法创建本地缓存文件！");
+                            }
+                        } else {
+                            ESP_LOGI(TAG, "收到响应，但当前没有线程在等待。");
+                        }
                     } else {
-                        printf("来自卫星 (%d, %d) 报错: %s\n", frame->src_i, frame->src_j, frame->payload);
+                        ESP_LOGE(TAG, "来自卫星 (%d, %d) 报错: %s", frame->src_i, frame->src_j, frame->payload);
+                        if (g_remote_is_waiting) {
+                            g_remote_fetch_status = -1; // 标记失败
+                            #ifdef __linux__
+                            sem_post(&g_sync_sem);
+                            #else
+                            xSemaphoreGive(g_sync_sem);
+                            #endif
+                        }
                     }
                     printf("======================================================\n");
                 }

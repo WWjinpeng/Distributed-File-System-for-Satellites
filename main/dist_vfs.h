@@ -44,12 +44,13 @@
 #pragma pack(push, 1)
 typedef struct
 {
-    uint8_t start_byte;
+    uint8_t start_byte; //帧起始标志
     uint8_t src_i, src_j;
     uint8_t dst_i, dst_j;
-    uint8_t type;
-    uint16_t path_len;
-    uint32_t data_len;
+    uint8_t type; //报文类型
+    uint16_t path_len; //文件路径的字符串长度
+    uint32_t data_len; //实际数据部分的长度
+    
     char payload[512]; 
 } ssp_frame_t;
 #pragma pack(pop)

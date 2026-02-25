@@ -67,9 +67,32 @@ void run_edfs_logic(uint8_t node_i, uint8_t node_j)
         
         // 我们等 3 秒钟，确保其他节点都已经完全启动
         usleep(3000000);
-        fopen(remote_path, "r");
+        
+        // ================= 需要修改的地方：真正读取并打印 =================
+        ESP_LOGI("APP", "准备调用 fopen，预期将发生阻塞等待远端回传...");
+        FILE *f3 = fopen(remote_path, "r");
+        
+        if (f3) {
+            ESP_LOGI("APP", "fopen 阻塞结束，已拿到有效文件指针！准备读取内容：");
+            char buf[256] = {0};
+            size_t bytes = fread(buf, 1, sizeof(buf) - 1, f3);
+            if (bytes > 0) {
+                printf("\n======================================================\n");
+                printf("!!! 成功跨节点 (通过中继) 读取到远端文件 !!!\n");
+                printf("读取到的字节数: %zu\n", bytes);
+                printf("远端文件内容:\n%s\n", buf);
+                printf("======================================================\n\n");
+            } else {
+                ESP_LOGE("APP", "文件已打开，但读取内容为空");
+            }
+            fclose(f3);
+        } else {
+            ESP_LOGE("APP", "跨节点读取失败，fopen 返回 NULL (可能超时或远端不存在)");
+        }
+        // ==================================================================
+        
     } else {
-        ESP_LOGI("APP", "*** 当前 Linux 节点进入静默监听状态，充当中继路由... ***\n");
+        ESP_LOGI("APP", "*** 当前 Linux 节点 (%d, %d) 进入静默监听状态，充当中继路由... ***\n", node_i, node_j);
     }
 #else
     ESP_LOGI("APP", "*** [ESP32 硬件节点] 启动完毕，进入静默监听并随时准备响应！ ***\n");
