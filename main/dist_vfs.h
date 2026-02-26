@@ -39,6 +39,7 @@
 #define SSP_START_BYTE 0x5A
 #define SSP_TYPE_READ      0x01
 #define SSP_TYPE_WRITE     0x02
+#define SSP_TYPE_LIST_DIR  0x03 // [新增] 目录快照拉取请求
 #define SSP_TYPE_RESP_DATA 0x82 // [新增] 数据响应包类型
 
 #pragma pack(push, 1)
@@ -65,7 +66,7 @@ typedef struct
 // 接口
 esp_err_t init_dist_storage_system(void);
 void init_node_identity(uint8_t i, uint8_t j);
-
-
 esp_err_t init_ssp_network(void);
+// [新增] 供应用层调用的拉取快照函数
+int edfs_pull_snapshot(uint8_t target_i, uint8_t target_j);
 #endif

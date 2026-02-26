@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+#include <dirent.h>  // 目录遍历支持
+#include <sys/stat.h> // 获取文件大小支持
 #include "dist_vfs.h"
 #include <stdio.h>
 #include <string.h>
@@ -416,6 +418,54 @@ int dist_linux_fseek(FILE *stream, long offset, int whence) { return fseek(strea
 #endif
 
 
+// ==========================================================
+// ====== 【新增：中心节点按需拉取远端快照】 ======
+// ==========================================================
+int edfs_pull_snapshot(uint8_t target_i, uint8_t target_j) {
+    g_remote_is_waiting = 1;
+    g_remote_fetch_status = -1;
+    
+    // 指定快照数据的本地存放位置
+    #ifdef __linux__
+    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "./sim_storage_%d_%d/.cache_snapshot", g_local_node.i, g_local_node.j);
+    #else
+    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "%s/.cache_snapshot", MOUNT_POINT_PHYSICAL);
+    #endif
+
+    ssp_frame_t frame;
+    ssp_pack_request(&frame, SSP_TYPE_LIST_DIR, target_i, target_j, ""); // 快照请求不需要路径
+    ESP_LOGI(TAG, "=> 正在向卫星 (%d, %d) 发送目录快照拉取请求...", target_i, target_j);
+    ssp_udp_send_packet(&frame);
+
+    // 阻塞等待接收线程组装完毕
+    #ifdef __linux__
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5; // 5秒超时
+    if (sem_timedwait(&g_sync_sem, &ts) != 0) ESP_LOGE(TAG, "拉取快照超时！");
+    #else
+    if (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(5000)) != pdTRUE) ESP_LOGE(TAG, "拉取快照超时！");
+    #endif
+
+    g_remote_is_waiting = 0;
+    
+    // 如果获取成功，直接在控制台华丽地打印出来
+    if (g_remote_fetch_status == 0) {
+        FILE *f = fopen(g_remote_cache_path, "r");
+        if (f) {
+            printf("\n");
+            char buf[256];
+            while (fgets(buf, sizeof(buf), f)) {
+                printf("\033[1;36m%s\033[0m", buf); // 使用青色高亮打印
+            }
+            printf("\n");
+            fclose(f);
+        }
+    }
+    return g_remote_fetch_status;
+}
+
+
 esp_err_t init_dist_storage_system(void)
 {
 
@@ -704,7 +754,88 @@ static void ssp_rx_task(void* arg)
                         }
                     }
                 }
+                // ============== 处理【目录快照拉取请求】 ==============
+                else if (frame->type == SSP_TYPE_LIST_DIR) {
+                    ESP_LOGI(TAG, "=> 收到远端节点 (%d, %d) 的快照拉取请求", frame->src_i, frame->src_j);
+                    
+                    char base_path[256];
+                    char snap_path[256];
+                    #ifdef __linux__
+                    snprintf(base_path, sizeof(base_path), "./sim_storage_%d_%d", g_local_node.i, g_local_node.j);
+                    snprintf(snap_path, sizeof(snap_path), "./sim_storage_%d_%d/.snapshot.txt", g_local_node.i, g_local_node.j);
+                    #else
+                    snprintf(base_path, sizeof(base_path), "%s", MOUNT_POINT_PHYSICAL);
+                    snprintf(snap_path, sizeof(snap_path), "%s/.snapshot.txt", MOUNT_POINT_PHYSICAL);
+                    #endif
 
+                    // 1. 遍历目录并生成快照文件
+                    FILE *sf = fopen(snap_path, "w");
+                    if (sf) {
+                        DIR *dir = opendir(base_path);
+                        if (dir) {
+                            struct dirent *ent;
+                            fprintf(sf, "=================================================\n");
+                            fprintf(sf, " Node (%d, %d) Storage Snapshot\n", g_local_node.i, g_local_node.j);
+                            fprintf(sf, "=================================================\n");
+                            while ((ent = readdir(dir)) != NULL) {
+                                // 过滤掉隐藏文件和系统缓存文件，保持界面干净
+                                if (ent->d_name[0] == '.') continue;
+                                
+                                char filepath[512];
+                                snprintf(filepath, sizeof(filepath), "%s/%s", base_path, ent->d_name);
+                                struct stat st;
+                                if (stat(filepath, &st) == 0) {
+                                    fprintf(sf, "[FILE] %-20s | Size: %ld bytes\n", ent->d_name, (long)st.st_size);
+                                }
+                            }
+                            closedir(dir);
+                        } else {
+                            fprintf(sf, "Failed to read directory.\n");
+                        }
+                        fclose(sf);
+                    }
+
+                    // 2. 复用已有的分片发送逻辑，将快照文件传回中心节点
+                    FILE *f = fopen(snap_path, "r");
+                    if (f) {
+                        fseek(f, 0, SEEK_END);
+                        uint32_t total_size = ftell(f);
+                        fseek(f, 0, SEEK_SET);
+
+                        uint32_t current_offset = 0;
+                        while (current_offset < total_size) {
+                            ssp_frame_t resp_frame;
+                            memset(&resp_frame, 0, sizeof(ssp_frame_t));
+                            resp_frame.start_byte = SSP_START_BYTE;
+                            resp_frame.src_i = g_local_node.i;
+                            resp_frame.src_j = g_local_node.j;
+                            resp_frame.dst_i = frame->src_i; 
+                            resp_frame.dst_j = frame->src_j;
+                            resp_frame.type = SSP_TYPE_RESP_DATA; 
+                            resp_frame.file_offset = current_offset;
+                            resp_frame.file_size = total_size;
+
+                            size_t bytes_to_read = total_size - current_offset;
+                            if (bytes_to_read > sizeof(resp_frame.payload) - 1) bytes_to_read = sizeof(resp_frame.payload) - 1;
+
+                            size_t bytes = fread(resp_frame.payload, 1, bytes_to_read, f);
+                            resp_frame.data_len = bytes;
+                            resp_frame.path_len = 0; 
+                            
+                            ssp_udp_send_packet(&resp_frame);
+                            current_offset += bytes;
+
+                            #ifdef __linux__
+                            struct timespec req = {0, 5000000}; 
+                            nanosleep(&req, NULL);
+                            #else
+                            vTaskDelay(pdMS_TO_TICKS(10)); 
+                            #endif
+                        }
+                        fclose(f);
+                        ESP_LOGI(TAG, "=> 快照生成并回传完毕！");
+                    }
+                }
             } else {
                 ESP_LOGE(TAG, "收到未知格式数据包，已丢弃");
             }

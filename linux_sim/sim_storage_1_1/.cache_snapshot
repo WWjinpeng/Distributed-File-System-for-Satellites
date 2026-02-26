@@ -1,0 +1,9 @@
+=================================================
+ Node (1, 3) Storage Snapshot
+=================================================
+[FILE] sat_log.txt          | Size: 31 bytes
+[FILE] satellite_v5.log     | Size: 0 bytes
+[FILE] test.txt             | Size: 35 bytes
+[FILE] test_a.txt           | Size: 5700 bytes
+[FILE] upload_test.txt      | Size: 3540 bytes
+[FILE] write_test.txt       | Size: 24 bytes
