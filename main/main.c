@@ -90,7 +90,21 @@ void run_edfs_logic(uint8_t node_i, uint8_t node_j)
         } else {
             ESP_LOGE("APP", "跨节点读取失败，fopen 返回 NULL (可能超时或远端不存在)");
         }
-        // ==================================================================
+        // ================= 增加远端写入测试 =================
+        ESP_LOGI("APP", "\n\n*** 测试 D: 尝试跨越中间节点，向远端 ESP32 卫星写入文件 ***");
+        char write_path[64];
+        sprintf(write_path, "/dist/remote/%d_%d/upload_test.txt", node_i, target_j);
+        
+        FILE *f_write = fopen(write_path, "w");
+        if (f_write) {
+            for(int t=0; t<50; t++) {
+                fprintf(f_write, "这是 Linux(1,1) 主动传给 ESP32(1,3) 的机密数据，第 %d 行\n", t);
+            }
+            ESP_LOGI("APP", "数据循环 fwrite 完成，准备 fclose 触发网络刷盘...");
+            fclose(f_write); // 这里会真正触发 UDP 切片发送
+            ESP_LOGI("APP", "网络刷盘结束！");
+        }
+        // ====================================================
         
     } else {
         ESP_LOGI("APP", "*** 当前 Linux 节点 (%d, %d) 进入静默监听状态，充当中继路由... ***\n", node_i, node_j);

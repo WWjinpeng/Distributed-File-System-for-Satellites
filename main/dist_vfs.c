@@ -41,9 +41,21 @@ static volatile int g_remote_is_waiting = 0;      // 是否正在等待
 static char g_remote_wait_path[256] = {0};        // 正在等待的远端路径
 static char g_remote_cache_path[256] = {0};       // 期望保存的本地缓存路径
 static volatile int g_remote_fetch_status = -1;   // 获取结果: 0成功, -1失败
-
 static volatile uint32_t g_remote_received_bytes = 0; // 已接收的字节数
 static volatile uint32_t g_remote_total_bytes = 0;    // 预期接收的总字节数
+
+
+// --- 新增：远端写入控制变量 ---
+static volatile int g_is_remote_writing = 0;      // 是否正处于远端写入的缓存阶段
+static uint8_t g_write_target_i = 0;              // 写入目标节点 i
+static uint8_t g_write_target_j = 0;              // 写入目标节点 j
+static char g_write_remote_path[256] = {0};       // 目标节点的逻辑路径
+static char g_write_cache_path[256] = {0};        // 本地生成的临时写入缓存路径
+#ifdef __linux__
+static FILE* g_write_linux_file = NULL;           // 记录当前打开的 Linux 远端写入文件指针
+#else
+static int g_write_esp_fd = -1;                   // 记录当前打开的 ESP32 远端写入文件描述符
+#endif
 
 static const char *TAG = "EDFS_VFS";
 static node_coord_t g_local_node = {1, 1};
@@ -55,7 +67,7 @@ static node_coord_t g_local_node = {1, 1};
 // 简易路由表：判定下一跳应该走哪个物理设备的 IP
 const char* get_node_ip(uint8_t j) {
     if (j == 3) {
-        return PC_LAN_IP; // 设定 (1,3) 是 ESP32 硬件板
+        return ESP_LAN_IP; // 设定 (1,3) 是 ESP32 硬件板
     }
     return PC_LAN_IP;      // (1,1) 和 (1,2) 都在电脑仿真端
 }
@@ -216,6 +228,86 @@ static int fetch_remote_file_sync(int target_i, int target_j, const char* remote
     return g_remote_fetch_status; // 如果网络层成功写入缓存，此处为 0
 }
 
+
+// ==========================================================
+// ====== 【新增核心：关闭文件时将缓存切片刷入远端】 ======
+// ==========================================================
+static void flush_remote_write_sync(void) {
+    FILE *f = fopen(g_write_cache_path, "rb");
+    if (!f) return;
+    
+    // 获取缓存文件总大小
+    fseek(f, 0, SEEK_END);
+    uint32_t total_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    ESP_LOGI(TAG, "[VFS] 开始将本地写入缓存刷入远端节点(%d,%d)，总大小: %u 字节", 
+             g_write_target_i, g_write_target_j, total_size);
+
+    uint32_t current_offset = 0;
+    uint16_t path_len = strlen(g_write_remote_path);
+
+    // 计算 payload 中留给纯数据的最大空间
+    size_t max_data_len = sizeof(((ssp_frame_t*)0)->payload) - path_len - 1;
+
+    // 处理空文件的情况
+    if (total_size == 0) {
+        ssp_frame_t frame;
+        memset(&frame, 0, sizeof(ssp_frame_t));
+        frame.start_byte = SSP_START_BYTE;
+        frame.src_i = g_local_node.i;
+        frame.src_j = g_local_node.j;
+        frame.dst_i = g_write_target_i;
+        frame.dst_j = g_write_target_j;
+        frame.type = SSP_TYPE_WRITE;
+        frame.file_offset = 0;
+        frame.file_size = 0;
+        frame.path_len = path_len;
+        frame.data_len = 0;
+        strcpy(frame.payload, g_write_remote_path); // 放入路径
+        ssp_udp_send_packet(&frame);
+    }
+
+    // 大文件分片循环发送
+    while (current_offset < total_size) {
+        ssp_frame_t frame;
+        memset(&frame, 0, sizeof(ssp_frame_t));
+        frame.start_byte = SSP_START_BYTE;
+        frame.src_i = g_local_node.i;
+        frame.src_j = g_local_node.j;
+        frame.dst_i = g_write_target_i;
+        frame.dst_j = g_write_target_j;
+        frame.type = SSP_TYPE_WRITE;
+        frame.file_offset = current_offset;
+        frame.file_size = total_size;
+        frame.path_len = path_len;
+
+        // 1. 先把路径拷贝到 payload 头部
+        strcpy(frame.payload, g_write_remote_path);
+
+        // 2. 计算还能装多少数据，并读取到 payload 的路径之后
+        size_t bytes_to_read = total_size - current_offset;
+        if (bytes_to_read > max_data_len) bytes_to_read = max_data_len;
+        
+        size_t bytes = fread(frame.payload + path_len, 1, bytes_to_read, f);
+        frame.data_len = bytes;
+        
+        ssp_udp_send_packet(&frame);
+        current_offset += bytes;
+
+        #ifdef __linux__
+        struct timespec req = {0, 5000000}; // 5ms
+        nanosleep(&req, NULL);
+        #else
+        vTaskDelay(pdMS_TO_TICKS(10)); // ESP32 延迟 10ms
+        #endif
+    }
+    (fclose)(f);
+    ESP_LOGI(TAG, "[VFS] 远端文件刷盘完成！");
+}
+
+
+
 #ifndef __linux__
 // ESP32 VFS 绑定
 static int vfs_dist_open(void *ctx, const char *path, int flags, int mode) {
@@ -251,6 +343,7 @@ static off_t vfs_dist_lseek(void *ctx, int fd, off_t offset, int mode) { return 
 #undef fseek
 
 // Linux 宏替换绑定
+// 替换原有的 dist_linux_fopen
 FILE* dist_linux_fopen(const char *path, const char *mode) {
     char target[256];
     int is_remote = 0;
@@ -264,28 +357,61 @@ FILE* dist_linux_fopen(const char *path, const char *mode) {
     if (is_remote) {
         int di, dj;
         if (sscanf(target, "SSP_FORWARD:%d_%d", &di, &dj) == 2) {
-            char cache_path[256];
-            ESP_LOGI(TAG, "[VFS] 拦截到远程读取请求 %s，目标节点(%d, %d)", path, di, dj);
+            // 判定是否是写模式 (w, a, r+, w+ 等)
+            int is_write_mode = (strchr(mode, 'w') != NULL) || (strchr(mode, 'a') != NULL) || (strchr(mode, '+') != NULL);
             
-            // 触发同步阻塞获取
-            if (fetch_remote_file_sync(di, dj, path, cache_path) == 0) {
-                // 获取成功，直接打开本地刚刚生成的缓存文件返回给上层
-                ESP_LOGI(TAG, "[VFS] 远端文件获取完毕，将缓存文件指针移交上层");
-                return fopen(cache_path, mode);
+            if (is_write_mode) {
+                // ============== 【写入模式拦截】 ==============
+                snprintf(g_write_cache_path, sizeof(g_write_cache_path), "./sim_storage_%d_%d/.cache_write_remote", g_local_node.i, g_local_node.j);
+                FILE *f = fopen(g_write_cache_path, mode);
+                if (f) {
+                    g_is_remote_writing = 1;
+                    g_write_target_i = di;
+                    g_write_target_j = dj;
+                    strcpy(g_write_remote_path, path);
+                    g_write_linux_file = f;
+                    ESP_LOGI(TAG, "[VFS] 拦截到远程写入请求，创建本地缓存: %s", g_write_cache_path);
+                }
+                return f; // 将本地缓存文件指针骗过上层返回
             } else {
-                ESP_LOGE(TAG, "[VFS] 远端文件获取失败或超时");
-                return NULL; 
+                // ============== 【原有的读取模式拦截】 ==============
+                char cache_path[256];
+                ESP_LOGI(TAG, "[VFS] 拦截到远程读取请求 %s，目标节点(%d, %d)", path, di, dj);
+                if (fetch_remote_file_sync(di, dj, path, cache_path) == 0) {
+                    return fopen(cache_path, mode);
+                } else {
+                    return NULL; 
+                }
             }
         }
     }
-    
-    //printf("[%s] [本地路由] %s -> %s\n", TAG, path, target);
     return fopen(target, mode);
 }
 
 size_t dist_linux_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) { return fread(ptr, size, nmemb, stream); }
 size_t dist_linux_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) { return fwrite(ptr, size, nmemb, stream); }
-int dist_linux_fclose(FILE *stream) { if (!stream) return 0; return fclose(stream); }
+// 替换原有的 dist_linux_fclose
+int dist_linux_fclose(FILE *stream) { 
+    if (!stream) return 0; 
+    
+    // 提前判断并清理状态，防止递归
+    int should_flush = 0;
+    if (g_is_remote_writing && stream == g_write_linux_file) {
+        should_flush = 1;
+        g_is_remote_writing = 0;   // <--- 提前置零
+        g_write_linux_file = NULL; // <--- 提前清空
+    }
+
+    int ret = fclose(stream); // 执行真实的关闭
+    
+    // 如果刚才判断需要刷盘，现在安全地触发
+    if (should_flush) {
+        ESP_LOGI(TAG, "[VFS] 远端缓存文件关闭，正在触发延迟刷盘(网络发送)...");
+        flush_remote_write_sync();
+    }
+    
+    return ret; 
+}
 int dist_linux_fseek(FILE *stream, long offset, int whence) { return fseek(stream, offset, whence); }
 #endif
 
@@ -480,6 +606,50 @@ static void ssp_rx_task(void* arg)
                         err_frame.data_len = 0;
                         strcpy(err_frame.payload, "FILE_NOT_FOUND");
                         ssp_udp_send_packet(&err_frame);
+                    }
+                }
+                else if(frame->type == SSP_TYPE_WRITE){
+                    // 1. 从 payload 头部提取路径
+                    char req_path[256] = {0};
+                    if (frame->path_len > 0 && frame->path_len < sizeof(req_path)) {
+                        strncpy(req_path, frame->payload, frame->path_len);
+                    }
+                    
+                    const char *filename = strrchr(req_path, '/');
+                    if (!filename) filename = req_path;
+                    else filename++; 
+
+                    char local_path[2000];
+                    #ifdef __linux__
+                    snprintf(local_path, sizeof(local_path), "./sim_storage_%d_%d/%s", g_local_node.i, g_local_node.j, filename);
+                    #else
+                    snprintf(local_path, sizeof(local_path), "%s/%s", MOUNT_POINT_PHYSICAL, filename);
+                    #endif
+
+                    // 2. 计算纯数据在 payload 中的起始指针
+                    char *data_ptr = frame->payload + frame->path_len;
+
+                    // 3. 落盘逻辑
+                    FILE *f;
+                    if (frame->file_offset == 0) {
+                        f = fopen(local_path, "wb"); // 第一片：覆盖重建
+                    } else {
+                        f = fopen(local_path, "r+b"); // 后续片：修改
+                    }
+
+                    if (f) {
+                        fseek(f, frame->file_offset, SEEK_SET);
+                        fwrite(data_ptr, 1, frame->data_len, f);
+                        fclose(f);
+                        
+                        ESP_LOGI(TAG, "=> 接收到远端写入分片: %s [进度 %u / %u]", 
+                                 filename, frame->file_offset + frame->data_len, frame->file_size);
+                        
+                        if (frame->file_offset + frame->data_len >= frame->file_size) {
+                            ESP_LOGI(TAG, "=> 远端文件 [%s] 完整写入落盘完毕！", filename);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "无法打开本地文件供远端写入: %s", local_path);
                     }
                 }
                 // ============== 处理【数据响应】 ==============
