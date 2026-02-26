@@ -55,7 +55,7 @@ static node_coord_t g_local_node = {1, 1};
 // 简易路由表：判定下一跳应该走哪个物理设备的 IP
 const char* get_node_ip(uint8_t j) {
     if (j == 3) {
-        return ESP_LAN_IP; // 设定 (1,3) 是 ESP32 硬件板
+        return PC_LAN_IP; // 设定 (1,3) 是 ESP32 硬件板
     }
     return PC_LAN_IP;      // (1,1) 和 (1,2) 都在电脑仿真端
 }
@@ -116,7 +116,7 @@ void ssp_debug_print_frame(const ssp_frame_t *frame) {
     printf("Payload: %s\n", frame->payload);
     printf("Raw HEX: ");
     uint8_t *raw = (uint8_t *)frame;
-    for(size_t i = 0; i < (11 + frame->path_len); i++) {
+    for(size_t i = 0; i < (19 + frame->path_len); i++) {
         printf("%02X ", raw[i]);
     }
     printf("\n-------------------------\n");
@@ -163,7 +163,7 @@ void ssp_udp_send_packet(const ssp_frame_t *frame) {
     const char* target_ip = get_node_ip(next_j);
     dest_addr.sin_addr.s_addr = inet_addr(target_ip); 
 
-    int send_len = 12 + frame->path_len + frame->data_len;
+    int send_len = 20 + frame->path_len + frame->data_len;
     sendto(sock, frame, send_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     
     printf("[%s] [网络层] 数据包: 终点(%d,%d) -> 下一跳(%d,%d) [IP:%s Port:%d, Len:%d]\n", 
@@ -200,13 +200,13 @@ static int fetch_remote_file_sync(int target_i, int target_j, const char* remote
 #ifdef __linux__
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 3; // 设置 3 秒超时
+    ts.tv_sec += 10; // 设置 10 秒超时
     if (sem_timedwait(&g_sync_sem, &ts) != 0) {
         ESP_LOGE(TAG, "等待远端文件响应超时！");
     }
 #else
     // ESP32: 等待 3000 毫秒 (3秒)
-    if (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(3000)) != pdTRUE) {
+    if (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(10000)) != pdTRUE) {
         ESP_LOGE(TAG, "等待远端文件响应超时！");
     }
 #endif
@@ -420,61 +420,112 @@ static void ssp_rx_task(void* arg)
                     snprintf(local_path, sizeof(local_path), "%s/%s", MOUNT_POINT_PHYSICAL, filename);
                     #endif
 
-                    ssp_frame_t resp_frame;
-                    memset(&resp_frame, 0, sizeof(ssp_frame_t));
-                    resp_frame.start_byte = SSP_START_BYTE;
-                    resp_frame.src_i = g_local_node.i;
-                    resp_frame.src_j = g_local_node.j;
-                    resp_frame.dst_i = frame->src_i; 
-                    resp_frame.dst_j = frame->src_j;
-                    resp_frame.type = SSP_TYPE_RESP_DATA; 
-
                     FILE *f = fopen(local_path, "r");
                     if (f) {
-                        size_t bytes = fread(resp_frame.payload, 1, sizeof(resp_frame.payload) - 1, f);
-                        resp_frame.data_len = bytes;
-                        resp_frame.path_len = 0; 
-                        fclose(f);
-                        ESP_LOGI(TAG, "=> 成功读取本地文件，准备回传 %zu 字节数据", bytes);
-                    } else {
-                        resp_frame.data_len = 0;
-                        strcpy(resp_frame.payload, "FILE_NOT_FOUND");
-                        ESP_LOGE(TAG, "=> 请求的文件不存在，返回错误信息");
-                    }
+                        // 获取文件总大小
+                        fseek(f, 0, SEEK_END);
+                        uint32_t total_size = ftell(f);
+                        fseek(f, 0, SEEK_SET);
 
-                    // ESP32 现在也可以正大光明地回传文件了！
-                    ssp_udp_send_packet(&resp_frame);
+                        ESP_LOGI(TAG, "=> 开始发送文件，总大小: %u 字节", total_size);
+
+                        uint32_t current_offset = 0;
+                        while (current_offset < total_size) {
+                            ssp_frame_t resp_frame;
+                            memset(&resp_frame, 0, sizeof(ssp_frame_t));
+                            resp_frame.start_byte = SSP_START_BYTE;
+                            resp_frame.src_i = g_local_node.i;
+                            resp_frame.src_j = g_local_node.j;
+                            resp_frame.dst_i = frame->src_i; 
+                            resp_frame.dst_j = frame->src_j;
+                            resp_frame.type = SSP_TYPE_RESP_DATA; 
+                            
+                            // 设置分片信息
+                            resp_frame.file_offset = current_offset;
+                            resp_frame.file_size = total_size;
+
+                            // 计算本分片要读取的长度
+                            size_t bytes_to_read = total_size - current_offset;
+                            if (bytes_to_read > sizeof(resp_frame.payload) - 1) {
+                                bytes_to_read = sizeof(resp_frame.payload) - 1;
+                            }
+
+                            size_t bytes = fread(resp_frame.payload, 1, bytes_to_read, f);
+                            resp_frame.data_len = bytes;
+                            resp_frame.path_len = 0; 
+                            
+                            ssp_udp_send_packet(&resp_frame);
+                            current_offset += bytes;
+
+                            // 关键：加一点微小的延时，防止连续发送导致 UDP 缓冲区溢出丢包
+                            #ifdef __linux__
+                            struct timespec req = {0, 5000000}; // 5ms
+                            nanosleep(&req, NULL);
+                            #else
+                            vTaskDelay(pdMS_TO_TICKS(10)); // ESP32 延迟 10ms
+                            #endif
+                        }
+                        fclose(f);
+                        ESP_LOGI(TAG, "=> 文件全部分片发送完毕！");
+                    } else {
+                        // 文件不存在时的报错处理不变
+                        ssp_frame_t err_frame;
+                        memset(&err_frame, 0, sizeof(ssp_frame_t));
+                        err_frame.start_byte = SSP_START_BYTE;
+                        err_frame.src_i = g_local_node.i;
+                        err_frame.src_j = g_local_node.j;
+                        err_frame.dst_i = frame->src_i; 
+                        err_frame.dst_j = frame->src_j;
+                        err_frame.type = SSP_TYPE_RESP_DATA;
+                        err_frame.data_len = 0;
+                        strcpy(err_frame.payload, "FILE_NOT_FOUND");
+                        ssp_udp_send_packet(&err_frame);
+                    }
                 }
                 // ============== 处理【数据响应】 ==============
                 else if (frame->type == SSP_TYPE_RESP_DATA) {
-                    ESP_LOGI(TAG, "\n================ [ 远端文件内容到达 ] ================");
                     if (frame->data_len > 0) {
-                        // 如果有线程正在阻塞等待，并且路径匹配（这里简化为只要在等待就接收）
                         if (g_remote_is_waiting) {
-                            FILE *cache_f = fopen(g_remote_cache_path, "w");
+                            FILE *cache_f;
+                            // 偏移量为 0 说明是第一个包，用 "w" 模式覆盖旧文件并重置计数器
+                            if (frame->file_offset == 0) {
+                                cache_f = fopen(g_remote_cache_path, "wb");
+                                g_remote_received_bytes = 0;
+                                g_remote_total_bytes = frame->file_size;
+                            } else {
+                                // 后续的包使用 "r+" 模式（读写模式），以便使用 fseek 定位
+                                cache_f = fopen(g_remote_cache_path, "r+b"); 
+                            }
+                            
                             if (cache_f) {
+                                // 根据报文里的偏移量写入数据，这种方式天然抵抗 UDP 乱序
+                                fseek(cache_f, frame->file_offset, SEEK_SET);
                                 fwrite(frame->payload, 1, frame->data_len, cache_f);
                                 fclose(cache_f);
                                 
-                                g_remote_fetch_status = 0; // 标记成功
-                                ESP_LOGI(TAG, "远端数据已写入缓存: %s，正在唤醒应用层线程...", g_remote_cache_path);
+                                g_remote_received_bytes += frame->data_len;
+                                ESP_LOGI(TAG, "已接收分片: 偏移量 %u，当前进度: %u / %u 字节", 
+                                         frame->file_offset, g_remote_received_bytes, g_remote_total_bytes);
                                 
-                                // 释放信号量，唤醒等待的 `fopen`
-                                #ifdef __linux__
-                                sem_post(&g_sync_sem);
-                                #else
-                                xSemaphoreGive(g_sync_sem);
-                                #endif
+                                // 判断是否全部接收完毕
+                                if (g_remote_received_bytes >= g_remote_total_bytes) {
+                                    g_remote_fetch_status = 0; 
+                                    ESP_LOGI(TAG, "====== 文件所有分片重组完毕！正在唤醒应用层... ======");
+                                    
+                                    #ifdef __linux__
+                                    sem_post(&g_sync_sem);
+                                    #else
+                                    xSemaphoreGive(g_sync_sem);
+                                    #endif
+                                }
                             } else {
-                                ESP_LOGE(TAG, "无法创建本地缓存文件！");
+                                ESP_LOGE(TAG, "无法打开本地缓存文件进行重组！");
                             }
-                        } else {
-                            ESP_LOGI(TAG, "收到响应，但当前没有线程在等待。");
                         }
                     } else {
                         ESP_LOGE(TAG, "来自卫星 (%d, %d) 报错: %s", frame->src_i, frame->src_j, frame->payload);
                         if (g_remote_is_waiting) {
-                            g_remote_fetch_status = -1; // 标记失败
+                            g_remote_fetch_status = -1; // 失败
                             #ifdef __linux__
                             sem_post(&g_sync_sem);
                             #else
@@ -482,7 +533,6 @@ static void ssp_rx_task(void* arg)
                             #endif
                         }
                     }
-                    printf("======================================================\n");
                 }
 
             } else {

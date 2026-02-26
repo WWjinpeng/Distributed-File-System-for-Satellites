@@ -33,6 +33,7 @@ void run_edfs_logic(uint8_t node_i, uint8_t node_j)
     FILE *f1 = fopen("/dist/local/test_a.txt", "w");
     if (f1)
     {
+        for(int t=0;t<100;t++)
         fprintf(f1, "Hello Satellite Storage from (%d, %d) [HW Platform: %s]\n", node_i, node_j, 
 #ifdef __linux__
                 "Linux"

@@ -50,7 +50,8 @@ typedef struct
     uint8_t type; //报文类型
     uint16_t path_len; //文件路径的字符串长度
     uint32_t data_len; //实际数据部分的长度
-    
+    uint32_t file_offset; // 当前分片在文件中的偏移量
+    uint32_t file_size;   // 文件的总大小
     char payload[512]; 
 } ssp_frame_t;
 #pragma pack(pop)
