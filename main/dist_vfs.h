@@ -40,6 +40,7 @@
 #define SSP_TYPE_READ      0x01
 #define SSP_TYPE_WRITE     0x02
 #define SSP_TYPE_LIST_DIR  0x03 // [新增] 目录快照拉取请求
+#define SSP_TYPE_ACK       0x04 // [新增] 接收确认包
 #define SSP_TYPE_RESP_DATA 0x82 // [新增] 数据响应包类型
 
 #pragma pack(push, 1)
