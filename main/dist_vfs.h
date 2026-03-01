@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-
+#include "ikcp.h"
 #ifdef __linux__
     #include <pthread.h> // Linux 多线程支持
     typedef int esp_err_t;
@@ -42,19 +42,18 @@
 #define SSP_TYPE_LIST_DIR  0x03 // [新增] 目录快照拉取请求
 #define SSP_TYPE_ACK       0x04 // [新增] 接收确认包
 #define SSP_TYPE_RESP_DATA 0x82 // [新增] 数据响应包类型
+#define SSP_TYPE_KCP_DATA  0x10 // [新增] KCP 数据包
+
 
 #pragma pack(push, 1)
 typedef struct
 {
-    uint8_t start_byte; //帧起始标志
-    uint8_t src_i, src_j;
-    uint8_t dst_i, dst_j;
-    uint8_t type; //报文类型
-    uint16_t path_len; //文件路径的字符串长度
-    uint32_t data_len; //实际数据部分的长度
-    uint32_t file_offset; // 当前分片在文件中的偏移量
-    uint32_t file_size;   // 文件的总大小
-    char payload[512]; 
+    uint8_t start_byte;   // 帧起始标志 (0x5A)
+    uint8_t src_i, src_j; // 源节点坐标
+    uint8_t dst_i, dst_j; // 目的节点坐标
+    uint8_t type;         // 报文类型 (如果是 KCP 数据，就是 0x10)
+    uint16_t data_len;    // 后面 Payload 里的真实数据长度
+    char payload[1400];   // 留给 KCP 的大容量车厢 (ESP32 MTU 允许 1400)
 } ssp_frame_t;
 #pragma pack(pop)
 

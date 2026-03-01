@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
-
+#include <stdlib.h>
 #ifdef __linux__
 // --- Linux 网络头文件 ---
 #include <unistd.h>
@@ -17,7 +17,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <semaphore.h> //Linux 信号量支持
 #include <time.h>      //Linux 超时机制支持
 #else
 // --- ESP32 网络及文件系统头文件 ---
@@ -25,28 +24,16 @@
 #include "esp_littlefs.h"
 #include "lwip/sockets.h" // ESP32 的套接字库，和 Linux API 一样
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h" //ESP32 信号量支持
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 #endif
 
 // ==========================================
 // ====== 同步阻塞相关的全局状态与信号量 ======
 // ==========================================
-#ifdef __linux__
-static sem_t g_sync_sem;
-static sem_t g_ack_sem; // [新增] 用于写操作等待 ACK
-#else
-static SemaphoreHandle_t g_sync_sem = NULL;
-static SemaphoreHandle_t g_ack_sem = NULL; // [新增]
-#endif
 
 // 记录当前正在等待的远程文件状态
-static volatile int g_remote_is_waiting = 0;               // 是否正在等待
-static char g_remote_wait_path[256] = {0};                 // 正在等待的远端路径
 static char g_remote_cache_path[256] = {0};                // 期望保存的本地缓存路径
-static volatile int g_remote_fetch_status = -1;            // 获取结果: 0成功, -1失败
-static volatile uint32_t g_remote_received_bytes = 0;      // 已接收的字节数
-static volatile uint32_t g_remote_total_bytes = 0;         // 预期接收的总字节数
-static volatile uint32_t g_last_acked_offset = 0xFFFFFFFF; // [新增] 记录最近一次收到的 ACK 偏移量
 
 // --- 新增：远端写入控制变量 ---
 static volatile int g_is_remote_writing = 0; // 是否正处于远端写入的缓存阶段
@@ -54,6 +41,33 @@ static uint8_t g_write_target_i = 0;         // 写入目标节点 i
 static uint8_t g_write_target_j = 0;         // 写入目标节点 j
 static char g_write_remote_path[256] = {0};  // 目标节点的逻辑路径
 static char g_write_cache_path[256] = {0};   // 本地生成的临时写入缓存路径
+
+static ikcpcb *g_kcp_client = NULL; // 供发起方 (例如拉取或写入数据) 使用的 KCP 实例
+static ikcpcb *g_kcp_server = NULL; // 供接收方 (例如被动回传数据) 使用的 KCP 实例
+
+// 记录当前 KCP 正在通信的对端坐标，方便 output 回调函数知道往哪发
+static uint8_t g_kcp_target_i = 0;
+static uint8_t g_kcp_target_j = 0;
+
+// KCP 内存分配钩子映射
+void* kcp_malloc(size_t size) { return malloc(size); }
+void kcp_free(void* ptr) { free(ptr); }
+
+// ====== [新增] Server 状态机 ======
+#define SVR_IDLE 0
+#define SVR_SENDING 1
+#define SVR_RECEIVING 2
+
+static volatile int g_svr_state = SVR_IDLE;
+static FILE* g_svr_file = NULL;
+static uint32_t g_svr_file_size = 0;
+static uint32_t g_svr_processed = 0;
+
+// ====== 废弃旧变量 ======
+// 注意：之前定义的 g_sync_sem, g_ack_sem, g_remote_is_waiting, g_remote_received_bytes 等 
+// 以及处理超时的代码统统不需要了！KCP 内部已经包含了这些！
+
+
 #ifdef __linux__
 static FILE *g_write_linux_file = NULL; // 记录当前打开的 Linux 远端写入文件指针
 #else
@@ -137,29 +151,18 @@ void ssp_debug_print_frame(const ssp_frame_t *frame)
     printf("\n--- [SSP FRAME DEBUG] ---\n");
     printf("Header:  0x%02X | Type: %02X\n", frame->start_byte, frame->type);
     printf("Route:   (%d, %d) -> (%d, %d)\n", frame->src_i, frame->src_j, frame->dst_i, frame->dst_j);
-    printf("Payload: %s\n", frame->payload);
+    printf("Payload Length: %d\n", frame->data_len);
     printf("Raw HEX: ");
     uint8_t *raw = (uint8_t *)frame;
-    for (size_t i = 0; i < (19 + frame->path_len); i++)
+    // 基础头 7 字节 (start1+src2+dst2+type1+len2) + payload长度
+    for (size_t i = 0; i < (8 + frame->data_len); i++) 
     {
         printf("%02X ", raw[i]);
     }
     printf("\n-------------------------\n");
 }
 
-void ssp_pack_request(ssp_frame_t *frame, uint8_t type, uint8_t di, uint8_t dj, const char *path)
-{
-    memset(frame, 0, sizeof(ssp_frame_t));
-    frame->start_byte = SSP_START_BYTE;
-    frame->src_i = g_local_node.i;
-    frame->src_j = g_local_node.j;
-    frame->dst_i = di;
-    frame->dst_j = dj;
-    frame->type = type;
-    frame->path_len = (uint16_t)strlen(path);
-    frame->data_len = 0;
-    strncpy(frame->payload, path, sizeof(frame->payload) - 1);
-}
+
 
 // ==========================================================
 // ====== 【跨平台通用发送函数】 ======
@@ -195,7 +198,8 @@ void ssp_udp_send_packet(const ssp_frame_t *frame)
     const char *target_ip = get_node_ip(next_j);
     dest_addr.sin_addr.s_addr = inet_addr(target_ip);
 
-    int send_len = 20 + frame->path_len + frame->data_len;
+    // [修改这里]
+    int send_len = 8 + frame->data_len;
     sendto(sock, frame, send_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
     printf("[%s] [网络层] 数据包: 终点(%d,%d) -> 下一跳(%d,%d) [IP:%s Port:%d, Len:%d]\n",
@@ -205,142 +209,265 @@ void ssp_udp_send_packet(const ssp_frame_t *frame)
 }
 
 // ==========================================================
-// ====== 【READ：带自动重传的拉取循环】 ======
+// ====== [新增] KCP 底层发送回调函数 ======
 // ==========================================================
-static int fetch_remote_file_sync(int target_i, int target_j, const char *remote_path, char *out_cache_path)
-{
-    g_remote_is_waiting = 1;
-    g_remote_fetch_status = 1;
-    g_remote_received_bytes = 0;
-    g_remote_total_bytes = 1; // 给个初始假值以进入循环
-
-#ifdef __linux__
-    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "./sim_storage_%d_%d/.cache_remote", g_local_node.i, g_local_node.j);
-#else
-    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "%s/.cache_remote", MOUNT_POINT_PHYSICAL);
-#endif
-    strcpy(out_cache_path, g_remote_cache_path);
-
-    ESP_LOGI(TAG, "=> 发起同步远端读取，启用 ARQ 机制...");
-
-    // 只要没收全，就不断拉取（若丢包，g_remote_received_bytes 不变，自动重发同一片）
-    while (g_remote_received_bytes < g_remote_total_bytes)
-    {
-        ssp_frame_t frame;
-        ssp_pack_request(&frame, SSP_TYPE_READ, target_i, target_j, remote_path);
-        frame.file_offset = g_remote_received_bytes; // 明确要求特定偏移量
-
-        ssp_udp_send_packet(&frame);
-
-        // 等待响应 200ms
-        int sem_res = -1;
-#ifdef __linux__
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 500000000; // 500ms
-        if (ts.tv_nsec >= 1000000000)
-        {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
-        }
-        sem_res = sem_timedwait(&g_sync_sem, &ts);
-#else
-        sem_res = (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(500)) == pdTRUE) ? 0 : -1;
-#endif
-
-        if (sem_res != 0)
-        {
-            ESP_LOGI(TAG, "拉取 offset=%u 超时丢包，触发重传...", g_remote_received_bytes);
-        }
-        else if (g_remote_fetch_status == -1)
-        {
-            break; // 文件不存在的致命错误，直接退出
-        }
+// 当 KCP 需要发送数据时，它会调用这个函数。我们需要把 KCP 给的数据套上 SSP 路由头，用 UDP 发出去。
+static int ssp_kcp_output_callback(const char *buf, int len, ikcpcb *kcp, void *user) {
+    if (len > 1400) {
+        ESP_LOGE(TAG, "[KCP] 致命错误：KCP 抛出的数据长度 (%d) 超过了 Payload 限制！", len);
+        return -1;
     }
 
-    g_remote_is_waiting = 0;
-    return g_remote_fetch_status;
+    ssp_frame_t route_frame;
+    memset(&route_frame, 0, sizeof(ssp_frame_t));
+    route_frame.start_byte = SSP_START_BYTE;
+    route_frame.src_i = g_local_node.i;
+    route_frame.src_j = g_local_node.j;
+    route_frame.dst_i = g_kcp_target_i; // 使用全局记录的当前通信目标
+    route_frame.dst_j = g_kcp_target_j;
+    route_frame.type = SSP_TYPE_KCP_DATA; // 标记这是包裹了 KCP 数据的包
+    route_frame.data_len = (uint16_t)len; // KCP 数据的长度
+
+    // 将 KCP 吐出来的数据装进包心菜的最内层
+    memcpy(route_frame.payload, buf, len); 
+
+    // 直接复用我们之前写好的 UDP 发送函数
+    ssp_udp_send_packet(&route_frame);
+    return 0;
 }
 
 // ==========================================================
-// ====== 【WRITE：带自动重传的推送循环】 ======
+// ====== [新增] KCP 时钟驱动与状态更新线程 ======
 // ==========================================================
-static void flush_remote_write_sync(void)
-{
-    FILE *f = (fopen)(g_write_cache_path, "rb");
-    if (!f)
-        return;
+// 获取当前系统毫秒时间戳的辅助函数
+static IUINT32 iclock() {
+    #ifdef __linux__
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+    #else
+    return (IUINT32)(esp_timer_get_time() / 1000);
+    #endif
+}
 
-    fseek(f, 0, SEEK_END);
-    uint32_t total_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    uint32_t current_offset = 0;
-    uint16_t path_len = strlen(g_write_remote_path);
-    size_t max_data_len = sizeof(((ssp_frame_t *)0)->payload) - path_len - 1;
-
-    ESP_LOGI(TAG, "[VFS] 开启写操作 ARQ 刷盘，总大小: %u", total_size);
-
-    while (current_offset <= total_size)
-    { // 注意这里是 <=，为了处理空文件
-        ssp_frame_t frame;
-        memset(&frame, 0, sizeof(ssp_frame_t));
-        frame.start_byte = SSP_START_BYTE;
-        frame.src_i = g_local_node.i;
-        frame.src_j = g_local_node.j;
-        frame.dst_i = g_write_target_i;
-        frame.dst_j = g_write_target_j;
-        frame.type = SSP_TYPE_WRITE;
-        frame.file_offset = current_offset;
-        frame.file_size = total_size;
-        frame.path_len = path_len;
-        strcpy(frame.payload, g_write_remote_path);
-
-        size_t bytes_to_read = total_size - current_offset;
-        if (bytes_to_read > max_data_len)
-            bytes_to_read = max_data_len;
-
-        fseek(f, current_offset, SEEK_SET); // 确保读取位置正确
-        size_t bytes = fread(frame.payload + path_len, 1, bytes_to_read, f);
-        frame.data_len = bytes;
-
-        ssp_udp_send_packet(&frame);
-
-        // 如果是发送 0 字节文件，发完直接退
-        if (total_size == 0)
-            break;
-
-        // 等待 ACK 200ms
-        int sem_res = -1;
+// 这个线程每 10ms 运行一次，驱动 KCP 检查是否需要重传或者发送积压的 ACK
 #ifdef __linux__
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 500000000;
-        if (ts.tv_nsec >= 1000000000)
-        {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
-        }
-        sem_res = sem_timedwait(&g_ack_sem, &ts);
+static void* kcp_update_thread(void* arg)
 #else
-        sem_res = (xSemaphoreTake(g_ack_sem, pdMS_TO_TICKS(500)) == pdTRUE) ? 0 : -1;
+static void kcp_update_task(void* arg)
 #endif
-
-        if (sem_res == 0 && g_last_acked_offset == current_offset)
-        {
-            current_offset += bytes; // ACK 确认无误，滑动窗口到下一片
+{
+    while (1) {
+        IUINT32 current_time = iclock();
+        //先用局部变量接住指针，防止主线程随时置空
+        ikcpcb *client = g_kcp_client;
+        ikcpcb *server = g_kcp_server;
+        if (client) ikcp_update(client, current_time); // [修改] 这里用局部的 client
+        if (server) ikcp_update(server, current_time); // [修改] 这里用局部的 server
+        
+        // [新增] 驱动 Server 端后台发送大文件
+        if (g_svr_state == SVR_SENDING && g_svr_file) {
+            // 只要队列未满，就不停塞数据，KCP会负责打包和拥塞控制！
+            while (ikcp_waitsnd(g_kcp_server) < 16 && g_svr_processed < g_svr_file_size) {
+                char chunk[1024];
+                size_t bytes = fread(chunk, 1, sizeof(chunk), g_svr_file);
+                if (bytes > 0) {
+                    ikcp_send(g_kcp_server, chunk, bytes);
+                    g_svr_processed += bytes;
+                } else break;
+            }
+            // 发完了，回归安静
+            if (g_svr_processed >= g_svr_file_size) {
+                fclose(g_svr_file); g_svr_file = NULL;
+                g_svr_state = SVR_IDLE;
+                ESP_LOGI(TAG, "=> [Server] 响应数据推送至 KCP 队列完毕！");
+            }
         }
-        else
-        {
-            ESP_LOGI(TAG, "写操作 offset=%u 未收到 ACK 或丢包，触发重发...", current_offset);
-        }
 
-        if (current_offset >= total_size)
-            break; // 全部发送且确认完毕
+        #ifdef __linux__
+        struct timespec req = {0, 10000000}; // 10ms
+        nanosleep(&req, NULL);
+        #else
+        vTaskDelay(pdMS_TO_TICKS(10));
+        #endif
+    }
+    #ifdef __linux__
+    return NULL;
+    #endif
+}
+
+
+// ==========================================================
+// ====== 【KCP 改造】Client 读取远端文件 ======
+// ==========================================================
+static int fetch_remote_file_sync(int target_i, int target_j, const char* remote_path, char* out_cache_path) {
+    g_kcp_target_i = target_i; g_kcp_target_j = target_j;
+if (!g_kcp_client) {
+        g_kcp_client = ikcp_create(0x1122, NULL); 
+        g_kcp_client->output = ssp_kcp_output_callback;
+        ikcp_nodelay(g_kcp_client, 1, 10, 2, 1);  // 开启 Turbo 模式
+        ikcp_wndsize(g_kcp_client, 32, 32);      // ESP32 内存保护限制
+    }  
+
+    #ifdef __linux__
+    snprintf(out_cache_path, 256, "./sim_storage_%d_%d/.cache_remote", g_local_node.i, g_local_node.j);
+    #else
+    snprintf(out_cache_path, 256, "%s/.cache_remote", MOUNT_POINT_PHYSICAL);
+    #endif
+
+    ESP_LOGI(TAG, "=> [KCP流] 发起拉取: %s", remote_path);
+    char req[256]; req[0] = 0x01; // CMD_READ
+    strcpy(req + 1, remote_path);
+    ikcp_send(g_kcp_client, req, 2 + strlen(remote_path)); // 发送请求
+
+    FILE *f = fopen(out_cache_path, "wb");
+    if (!f) return -1;
+
+    uint32_t total_size = 0, received = 0;
+    int header_parsed = 0;
+    IUINT32 start_time = iclock();
+
+    // 不断地从 KCP 管道里“吸”数据，丢包重传 KCP 在后台自动搞定
+    while (1) {
+        if (iclock() - start_time > 5000) { ESP_LOGE(TAG, "KCP 连接超时！"); break; }
+        char buf[1024];
+        int len = ikcp_recv(g_kcp_client, buf, sizeof(buf));
+        if (len > 0) {
+            start_time = iclock(); // 喂狗
+            int data_offset = 0;
+            if (!header_parsed) {
+                memcpy(&total_size, buf, 4); // 报文头4字节是总大小
+                data_offset = 4; header_parsed = 1;
+                ESP_LOGI(TAG, "=> [KCP流] 文件总大小: %u", total_size);
+                if (total_size == 0) break;
+            }
+            if (len - data_offset > 0) {
+                fwrite(buf + data_offset, 1, len - data_offset, f);
+                received += (len - data_offset);
+            }
+            if (header_parsed && received >= total_size) {
+                ESP_LOGI(TAG, "=> [KCP流] 下载 100%% 成功！"); break;
+            }
+        }
+        #ifdef __linux__
+        usleep(10000); 
+        #else
+        vTaskDelay(pdMS_TO_TICKS(10));
+        #endif
+    }
+    fclose(f);
+    return (received >= total_size && header_parsed) ? 0 : -1;
+}
+
+// ==========================================================
+// ====== 【KCP 改造】Client 延迟刷盘 (写入) ======
+// ==========================================================
+static void flush_remote_write_sync(void) {
+    FILE *f = (fopen)(g_write_cache_path, "rb"); if (!f) return;
+    fseek(f, 0, SEEK_END); uint32_t total_size = ftell(f); fseek(f, 0, SEEK_SET);
+
+    g_kcp_target_i = g_write_target_i; g_kcp_target_j = g_write_target_j;
+    if (!g_kcp_client) {
+        g_kcp_client = ikcp_create(0x1122, NULL);
+        g_kcp_client->output = ssp_kcp_output_callback;
+        ikcp_nodelay(g_kcp_client, 1, 10, 2, 1);
+        ikcp_wndsize(g_kcp_client, 32, 32);
+    }
+
+    ESP_LOGI(TAG, "=> [KCP流] 开启高速刷盘, 大小: %u", total_size);
+    char req[256]; req[0] = 0x02; // CMD_WRITE
+    memcpy(req + 1, &total_size, 4);
+    strcpy(req + 5, g_write_remote_path);
+    ikcp_send(g_kcp_client, req, 6 + strlen(g_write_remote_path));
+
+    uint32_t sent = 0;
+    while (sent < total_size) {
+        // 如果发送队列没满，就疯狂往里塞
+        if (ikcp_waitsnd(g_kcp_client) < 16) {
+            char chunk[1024];
+            size_t bytes = fread(chunk, 1, sizeof(chunk), f);
+            ikcp_send(g_kcp_client, chunk, bytes);
+            sent += bytes;
+        } else {
+            #ifdef __linux__
+            usleep(10000);
+            #else
+            vTaskDelay(pdMS_TO_TICKS(10));
+            #endif
+        }
     }
     (fclose)(f);
-    ESP_LOGI(TAG, "[VFS] 远端文件 100%% 可靠刷盘完成！");
+
+    ESP_LOGI(TAG, "=> 数据已全推入队列，等待目标节点落盘 ACK...");
+    IUINT32 start_time = iclock();
+    while (1) {
+        if (iclock() - start_time > 5000) { ESP_LOGE(TAG, "KCP 等待 ACK 超时"); break; }
+        char buf[16];
+        if (ikcp_recv(g_kcp_client, buf, sizeof(buf)) > 0) {
+            if (buf[0] == 0x04) { ESP_LOGI(TAG, "=> [KCP流] 远端落盘 100%% 完成！"); break; }
+        }
+        #ifdef __linux__
+        usleep(10000);
+        #else
+        vTaskDelay(pdMS_TO_TICKS(10));
+        #endif
+    }
+    //ikcp_release(g_kcp_client); g_kcp_client = NULL;
 }
+
+// ==========================================================
+// ====== 【KCP 改造】Client 拉取快照 ======
+// ==========================================================
+int edfs_pull_snapshot(uint8_t target_i, uint8_t target_j) {
+    g_kcp_target_i = target_i; g_kcp_target_j = target_j;
+    if (!g_kcp_client) {
+        g_kcp_client = ikcp_create(0x1122, NULL); 
+        g_kcp_client->output = ssp_kcp_output_callback;
+        ikcp_nodelay(g_kcp_client, 1, 10, 2, 1);
+        ikcp_wndsize(g_kcp_client, 32, 32);
+    }
+
+    #ifdef __linux__
+    snprintf(g_remote_cache_path, 256, "./sim_storage_%d_%d/.cache_snapshot", g_local_node.i, g_local_node.j);
+    #else
+    snprintf(g_remote_cache_path, 256, "%s/.cache_snapshot", MOUNT_POINT_PHYSICAL);
+    #endif
+
+    ESP_LOGI(TAG, "=> 正在向卫星 (%d, %d) 发送快照拉取请求...", target_i, target_j);
+    char req[2] = {0x03, 0x00}; // CMD_LIST_DIR
+    ikcp_send(g_kcp_client, req, 2);
+
+    FILE *f = fopen(g_remote_cache_path, "wb"); if (!f) return -1;
+    uint32_t total_size = 0, received = 0;
+    int header_parsed = 0; IUINT32 start_time = iclock();
+
+    while (1) {
+        if (iclock() - start_time > 5000) { break; }
+        char buf[1024]; int len = ikcp_recv(g_kcp_client, buf, sizeof(buf));
+        if (len > 0) {
+            start_time = iclock(); 
+            int data_offset = 0;
+            if (!header_parsed) { memcpy(&total_size, buf, 4); data_offset = 4; header_parsed = 1; if (total_size == 0) break; }
+            if (len - data_offset > 0) { fwrite(buf + data_offset, 1, len - data_offset, f); received += (len - data_offset); }
+            if (header_parsed && received >= total_size) break;
+        }
+        #ifdef __linux__
+        usleep(10000); 
+        #else
+        vTaskDelay(pdMS_TO_TICKS(10));
+        #endif
+    }
+    fclose(f);
+
+    f = fopen(g_remote_cache_path, "r");
+    if (f) {
+        printf("\n"); char pbuf[256];
+        while (fgets(pbuf, sizeof(pbuf), f)) printf("\033[1;36m%s\033[0m", pbuf);
+        printf("\n"); fclose(f);
+    }
+    return 0;
+}
+
 
 #ifndef __linux__
 // ESP32 VFS 绑定
@@ -475,75 +602,11 @@ int dist_linux_fseek(FILE *stream, long offset, int whence) { return fseek(strea
 // ==========================================================
 // ====== 【LIST_DIR：同 READ 的自动重传机制】 ======
 // ==========================================================
-int edfs_pull_snapshot(uint8_t target_i, uint8_t target_j)
-{
-    g_remote_is_waiting = 1;
-    g_remote_fetch_status = 1;
-    g_remote_received_bytes = 0;
-    g_remote_total_bytes = 1;
 
-#ifdef __linux__
-    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "./sim_storage_%d_%d/.cache_snapshot", g_local_node.i, g_local_node.j);
-#else
-    snprintf(g_remote_cache_path, sizeof(g_remote_cache_path), "%s/.cache_snapshot", MOUNT_POINT_PHYSICAL);
-#endif
-
-    while (g_remote_received_bytes < g_remote_total_bytes)
-    {
-        ssp_frame_t frame;
-        ssp_pack_request(&frame, SSP_TYPE_LIST_DIR, target_i, target_j, "");
-        frame.file_offset = g_remote_received_bytes;
-        ssp_udp_send_packet(&frame);
-
-        int sem_res = -1;
-#ifdef __linux__
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 500000000;
-        if (ts.tv_nsec >= 1000000000)
-        {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
-        }
-        sem_res = sem_timedwait(&g_sync_sem, &ts);
-#else
-        sem_res = (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(500)) == pdTRUE) ? 0 : -1;
-#endif
-
-        if (sem_res != 0)
-            ESP_LOGI(TAG, "快照拉取 offset=%u 超时，重试...", g_remote_received_bytes);
-        else if (g_remote_fetch_status == -1)
-            break;
-    }
-
-    g_remote_is_waiting = 0;
-    if (g_remote_fetch_status == 0)
-    {
-        FILE *f = fopen(g_remote_cache_path, "r");
-        if (f)
-        {
-            printf("\n");
-            char buf[256];
-            while (fgets(buf, sizeof(buf), f))
-                printf("\033[1;36m%s\033[0m", buf);
-            printf("\n");
-            fclose(f);
-        }
-    }
-    return g_remote_fetch_status;
-}
 
 esp_err_t init_dist_storage_system(void)
 {
 
-// 初始化跨平台二值信号量
-#ifdef __linux__
-    sem_init(&g_sync_sem, 0, 0); // 初始值为0
-    sem_init(&g_ack_sem, 0, 0);  // [新增]
-#else
-    g_sync_sem = xSemaphoreCreateBinary();
-    g_ack_sem = xSemaphoreCreateBinary(); // [新增]
-#endif
 
 #ifdef __linux__
     char storage_dir[64];
@@ -631,290 +694,117 @@ static void ssp_rx_task(void *arg)
         {
             ssp_frame_t *frame = (ssp_frame_t *)rx_buffer;
 
-            if (frame->start_byte == SSP_START_BYTE)
-            {
-
-                if (frame->path_len > 0 && frame->path_len < sizeof(frame->payload))
-                {
-                    frame->payload[frame->path_len] = '\0';
-                }
-                if (frame->data_len > 0 && frame->data_len < sizeof(frame->payload))
-                {
-                    frame->payload[frame->data_len] = '\0';
-                }
-                // 包拦截与中继转发
-                if (frame->dst_i != g_local_node.i || frame->dst_j != g_local_node.j)
-                {
-                    ESP_LOGI(TAG, "=> [中继路由] 收到来自 (%d,%d) 发往 (%d,%d) 的包！目标不是我，执行转发...",
-                             frame->src_i, frame->src_j, frame->dst_i, frame->dst_j);
-
-#ifdef __linux__
-                    usleep(10000); // 0.1秒
-#else
-                    vTaskDelay(pdMS_TO_TICKS(10)); // ESP32 延时
-#endif
-
-                    ssp_udp_send_packet(frame); // 通用发送，无需 ifdef限制
-                    continue;
+            if (frame->start_byte == SSP_START_BYTE) {
+                // 中继路由：一秒识别，毫秒转发
+                if (frame->dst_i != g_local_node.i || frame->dst_j != g_local_node.j) {
+                    #ifdef __linux__
+                    usleep(5000); // KCP 中继可降至 5ms
+                    #else
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    #endif
+                    ssp_udp_send_packet(frame);
+                    continue; 
                 }
 
-                // ============== 处理【读取请求】 ==============
-                if (frame->type == SSP_TYPE_READ)
-                {
-                    const char *filename = strrchr(frame->payload, '/');
-                    if (!filename)
-                        filename = frame->payload;
-                    else
-                        filename++;
-                    char local_path[2000];
-#ifdef __linux__
-                    snprintf(local_path, sizeof(local_path), "./sim_storage_%d_%d/%s", g_local_node.i, g_local_node.j, filename);
-#else
-                    snprintf(local_path, sizeof(local_path), "%s/%s", MOUNT_POINT_PHYSICAL, filename);
-#endif
+                // 本地解包：识别 KCP 数据包
+                if (frame->type == SSP_TYPE_KCP_DATA) {
+                    // 如果是 Client 收到了回复
+                    if (g_kcp_client && frame->src_i == g_kcp_target_i && frame->src_j == g_kcp_target_j) {
+                        ikcp_input(g_kcp_client, frame->payload, frame->data_len);
+                    } else {
+                        // 我们是 Server，收到了别人的请求
+                        if (!g_kcp_server) {
+                            g_kcp_server = ikcp_create(0x1122, NULL);
+                            g_kcp_server->output = ssp_kcp_output_callback;
+                            ikcp_nodelay(g_kcp_server, 1, 10, 2, 1);
+                            ikcp_wndsize(g_kcp_server, 32, 32);
+                        }
+                        g_kcp_target_i = frame->src_i; 
+                        g_kcp_target_j = frame->src_j;
+                        ikcp_input(g_kcp_server, frame->payload, frame->data_len);
 
-                    FILE *f = fopen(local_path, "r");
-                    if (f)
-                    {
-                        fseek(f, 0, SEEK_END);
-                        uint32_t total_size = ftell(f);
-
-                        uint32_t req_offset = frame->file_offset;
-                        if (req_offset > total_size)
-                            req_offset = total_size;
-
-                        fseek(f, req_offset, SEEK_SET);
-
-                        ssp_frame_t resp_frame;
-                        memset(&resp_frame, 0, sizeof(ssp_frame_t));
-                        resp_frame.start_byte = SSP_START_BYTE;
-                        resp_frame.src_i = g_local_node.i;
-                        resp_frame.src_j = g_local_node.j;
-                        resp_frame.dst_i = frame->src_i;
-                        resp_frame.dst_j = frame->src_j;
-                        resp_frame.type = SSP_TYPE_RESP_DATA;
-                        resp_frame.file_offset = req_offset;
-                        resp_frame.file_size = total_size;
-
-                        size_t bytes_to_read = total_size - req_offset;
-                        if (bytes_to_read > sizeof(resp_frame.payload) - 1)
-                            bytes_to_read = sizeof(resp_frame.payload) - 1;
-
-                        size_t bytes = fread(resp_frame.payload, 1, bytes_to_read, f);
-                        resp_frame.data_len = bytes;
-                        resp_frame.path_len = 0;
-
-                        ssp_udp_send_packet(&resp_frame);
-                        fclose(f);
-                    }
-                    else
-                    {
-                        // 报错保持原样
-                        ssp_frame_t err_frame;
-                        memset(&err_frame, 0, sizeof(ssp_frame_t));
-                        err_frame.start_byte = SSP_START_BYTE;
-                        err_frame.src_i = g_local_node.i;
-                        err_frame.src_j = g_local_node.j;
-                        err_frame.dst_i = frame->src_i;
-                        err_frame.dst_j = frame->src_j;
-                        err_frame.type = SSP_TYPE_RESP_DATA;
-                        err_frame.data_len = 0;
-                        strcpy(err_frame.payload, "FILE_NOT_FOUND");
-                        ssp_udp_send_packet(&err_frame);
-                    }
-                }
-                else if (frame->type == SSP_TYPE_WRITE)
-                {
-                    // 1. 从 payload 头部提取路径
-                    char req_path[256] = {0};
-                    if (frame->path_len > 0 && frame->path_len < sizeof(req_path))
-                    {
-                        strncpy(req_path, frame->payload, frame->path_len);
-                    }
-
-                    const char *filename = strrchr(req_path, '/');
-                    if (!filename)
-                        filename = req_path;
-                    else
-                        filename++;
-
-                    char local_path[2000];
-#ifdef __linux__
-                    snprintf(local_path, sizeof(local_path), "./sim_storage_%d_%d/%s", g_local_node.i, g_local_node.j, filename);
-#else
-                    snprintf(local_path, sizeof(local_path), "%s/%s", MOUNT_POINT_PHYSICAL, filename);
-#endif
-
-                    // 2. 计算纯数据在 payload 中的起始指针
-                    char *data_ptr = frame->payload + frame->path_len;
-
-                    // 3. 落盘逻辑
-                    FILE *f;
-                    if (frame->file_offset == 0)
-                    {
-                        f = fopen(local_path, "wb"); // 第一片：覆盖重建
-                    }
-                    else
-                    {
-                        f = fopen(local_path, "r+b"); // 后续片：修改
-                    }
-
-                    if (f)
-                    {
-                        fseek(f, frame->file_offset, SEEK_SET);
-                        fwrite(data_ptr, 1, frame->data_len, f);
-                        fclose(f);
-
-                        // 【关键新增】落盘成功，发送 ACK 回执
-                        ssp_frame_t ack_frame;
-                        memset(&ack_frame, 0, sizeof(ssp_frame_t));
-                        ack_frame.start_byte = SSP_START_BYTE;
-                        ack_frame.src_i = g_local_node.i;
-                        ack_frame.src_j = g_local_node.j;
-                        ack_frame.dst_i = frame->src_i;
-                        ack_frame.dst_j = frame->src_j;
-                        ack_frame.type = SSP_TYPE_ACK;
-                        ack_frame.file_offset = frame->file_offset; // 确认这个分片
-                        ssp_udp_send_packet(&ack_frame);
-                    }
-                    else
-                    {
-                        ESP_LOGE(TAG, "无法打开本地文件供远端写入: %s", local_path);
-                    }
-                }
-                // ============== 处理【数据响应】 ==============
-                else if (frame->type == SSP_TYPE_RESP_DATA)
-                {
-                    if (frame->data_len > 0)
-                    {
-                        if (g_remote_is_waiting)
-                        {
-                            FILE *cache_f;
-                            if (frame->file_offset == 0)
-                                cache_f = fopen(g_remote_cache_path, "wb");
-                            else
-                                cache_f = fopen(g_remote_cache_path, "r+b");
-
-                            if (cache_f)
-                            {
-                                fseek(cache_f, frame->file_offset, SEEK_SET);
-                                fwrite(frame->payload, 1, frame->data_len, cache_f);
-                                fclose(cache_f);
-
-                                g_remote_received_bytes = frame->file_offset + frame->data_len;
-                                g_remote_total_bytes = frame->file_size;
-
-                                if (g_remote_received_bytes >= g_remote_total_bytes)
-                                {
-                                    g_remote_fetch_status = 0;
-                                    ESP_LOGI(TAG, "====== 文件所有分片重组完毕！ ======");
+                        // 提取命令，处理业务逻辑
+                        char buf[1024]; int len;
+                        while ((len = ikcp_recv(g_kcp_server, buf, sizeof(buf))) > 0) {
+                            if (g_svr_state == SVR_IDLE) {
+                                uint8_t cmd = buf[0];
+                                if (cmd == 0x01) { // 收到 READ 请求
+                                    char filename[256]; strcpy(filename, buf + 1);
+                                    const char *fbase = strrchr(filename, '/'); if (!fbase) fbase = filename; else fbase++; 
+                                    char local_path[512];
+                                    #ifdef __linux__
+                                    snprintf(local_path, sizeof(local_path), "./sim_storage_%d_%d/%s", g_local_node.i, g_local_node.j, fbase);
+                                    #else
+                                    snprintf(local_path, sizeof(local_path), "%s/%s", MOUNT_POINT_PHYSICAL, fbase);
+                                    #endif
+                                    g_svr_file = fopen(local_path, "r");
+                                    if (g_svr_file) {
+                                        fseek(g_svr_file, 0, SEEK_END); g_svr_file_size = ftell(g_svr_file); fseek(g_svr_file, 0, SEEK_SET);
+                                        ikcp_send(g_kcp_server, (const char*)&g_svr_file_size, 4); // 先发大小头
+                                        g_svr_processed = 0; g_svr_state = SVR_SENDING;
+                                    } else {
+                                        uint32_t zero = 0; ikcp_send(g_kcp_server, (const char*)&zero, 4);
+                                    }
+                                } 
+                                else if (cmd == 0x02) { // 收到 WRITE 请求
+                                    memcpy(&g_svr_file_size, buf + 1, 4);
+                                    char filename[256]; strcpy(filename, buf + 5);
+                                    const char *fbase = strrchr(filename, '/'); if (!fbase) fbase = filename; else fbase++; 
+                                    char local_path[512];
+                                    #ifdef __linux__
+                                    snprintf(local_path, sizeof(local_path), "./sim_storage_%d_%d/%s", g_local_node.i, g_local_node.j, fbase);
+                                    #else
+                                    snprintf(local_path, sizeof(local_path), "%s/%s", MOUNT_POINT_PHYSICAL, fbase);
+                                    #endif
+                                    g_svr_file = fopen(local_path, "wb");
+                                    g_svr_processed = 0; g_svr_state = SVR_RECEIVING;
+                                    ESP_LOGI(TAG, "=> [Server] 开始接收写入, 预期 %u 字节", g_svr_file_size);
                                 }
-
-// 【关键】释放信号量，唤醒等待的客户端去要下一片，或者退出
-#ifdef __linux__
-                                sem_post(&g_sync_sem);
-#else
-                                xSemaphoreGive(g_sync_sem);
-#endif
+                                else if (cmd == 0x03) { // 收到 LIST_DIR 请求
+                                    char base_path[256], snap_path[256];
+                                    #ifdef __linux__
+                                    snprintf(base_path, 256, "./sim_storage_%d_%d", g_local_node.i, g_local_node.j);
+                                    snprintf(snap_path, 256, "./sim_storage_%d_%d/.snapshot.txt", g_local_node.i, g_local_node.j);
+                                    #else
+                                    snprintf(base_path, 256, "%s", MOUNT_POINT_PHYSICAL);
+                                    snprintf(snap_path, 256, "%s/.snapshot.txt", MOUNT_POINT_PHYSICAL);
+                                    #endif
+                                    FILE *sf = fopen(snap_path, "w");
+                                    if (sf) {
+                                        DIR *dir = opendir(base_path);
+                                        if (dir) {
+                                            struct dirent *ent;
+                                            fprintf(sf, "=================================================\n Node (%d, %d) Storage Snapshot\n=================================================\n", g_local_node.i, g_local_node.j);
+                                            while ((ent = readdir(dir)) != NULL) {
+                                                if (ent->d_name[0] == '.') continue;
+                                                char filepath[512]; snprintf(filepath, sizeof(filepath), "%s/%s", base_path, ent->d_name);
+                                                struct stat st;
+                                                if (stat(filepath, &st) == 0) fprintf(sf, "[FILE] %-20s | Size: %ld bytes\n", ent->d_name, (long)st.st_size);
+                                            }
+                                            closedir(dir);
+                                        }
+                                        fclose(sf);
+                                    }
+                                    g_svr_file = fopen(snap_path, "r");
+                                    if (g_svr_file) {
+                                        fseek(g_svr_file, 0, SEEK_END); g_svr_file_size = ftell(g_svr_file); fseek(g_svr_file, 0, SEEK_SET);
+                                        ikcp_send(g_kcp_server, (const char*)&g_svr_file_size, 4);
+                                        g_svr_processed = 0; g_svr_state = SVR_SENDING;
+                                        ESP_LOGI(TAG, "=> [Server] 开始推送快照数据，大小: %u 字节", g_svr_file_size); // [加上这行日志]
+                                    }
+                                }
+                            } else if (g_svr_state == SVR_RECEIVING) { // 持续收流模式
+                                fwrite(buf, 1, len, g_svr_file);
+                                g_svr_processed += len;
+                                if (g_svr_processed >= g_svr_file_size) {
+                                    fclose(g_svr_file); g_svr_file = NULL;
+                                    g_svr_state = SVR_IDLE;
+                                    char ack = 0x04; ikcp_send(g_kcp_server, &ack, 1);
+                                    ESP_LOGI(TAG, "=> [Server] 文件接收落盘完成，已发送 ACK！");
+                                }
                             }
                         }
                     }
-                    else
-                    {
-                        ESP_LOGE(TAG, "来自卫星 (%d, %d) 报错: %s", frame->src_i, frame->src_j, frame->payload);
-                        if (g_remote_is_waiting)
-                        {
-                            g_remote_fetch_status = -1; // 失败
-#ifdef __linux__
-                            sem_post(&g_sync_sem);
-#else
-                            xSemaphoreGive(g_sync_sem);
-#endif
-                        }
-                    }
-                }
-                // ============== 处理【目录快照拉取请求】 ==============
-                else if (frame->type == SSP_TYPE_LIST_DIR)
-                {
-                    char base_path[256];
-                    char snap_path[256];
-#ifdef __linux__
-                    snprintf(base_path, sizeof(base_path), "./sim_storage_%d_%d", g_local_node.i, g_local_node.j);
-                    snprintf(snap_path, sizeof(snap_path), "./sim_storage_%d_%d/.snapshot.txt", g_local_node.i, g_local_node.j);
-#else
-                    snprintf(base_path, sizeof(base_path), "%s", MOUNT_POINT_PHYSICAL);
-                    snprintf(snap_path, sizeof(snap_path), "%s/.snapshot.txt", MOUNT_POINT_PHYSICAL);
-#endif
-
-                    // 只有在索要第0片时，才重新遍历目录生成快照
-                    if (frame->file_offset == 0)
-                    {
-                        FILE *sf = fopen(snap_path, "w");
-                        if (sf)
-                        {
-                            DIR *dir = opendir(base_path);
-                            if (dir)
-                            {
-                                struct dirent *ent;
-                                fprintf(sf, "=================================================\n");
-                                fprintf(sf, " Node (%d, %d) Storage Snapshot\n", g_local_node.i, g_local_node.j);
-                                fprintf(sf, "=================================================\n");
-                                while ((ent = readdir(dir)) != NULL)
-                                {
-                                    if (ent->d_name[0] == '.')
-                                        continue;
-                                    char filepath[512];
-                                    snprintf(filepath, sizeof(filepath), "%s/%s", base_path, ent->d_name);
-                                    struct stat st;
-                                    if (stat(filepath, &st) == 0)
-                                        fprintf(sf, "[FILE] %-20s | Size: %ld bytes\n", ent->d_name, (long)st.st_size);
-                                }
-                                closedir(dir);
-                            }
-                            fclose(sf);
-                        }
-                    }
-
-                    // 像发普通文件一样回传对应的分片
-                    FILE *f = fopen(snap_path, "r");
-                    if (f)
-                    {
-                        fseek(f, 0, SEEK_END);
-                        uint32_t total_size = ftell(f);
-                        uint32_t req_offset = frame->file_offset;
-                        if (req_offset > total_size)
-                            req_offset = total_size;
-
-                        fseek(f, req_offset, SEEK_SET);
-                        ssp_frame_t resp_frame;
-                        memset(&resp_frame, 0, sizeof(ssp_frame_t));
-                        resp_frame.start_byte = SSP_START_BYTE;
-                        resp_frame.src_i = g_local_node.i;
-                        resp_frame.src_j = g_local_node.j;
-                        resp_frame.dst_i = frame->src_i;
-                        resp_frame.dst_j = frame->src_j;
-                        resp_frame.type = SSP_TYPE_RESP_DATA;
-                        resp_frame.file_offset = req_offset;
-                        resp_frame.file_size = total_size;
-
-                        size_t bytes_to_read = total_size - req_offset;
-                        if (bytes_to_read > sizeof(resp_frame.payload) - 1)
-                            bytes_to_read = sizeof(resp_frame.payload) - 1;
-                        resp_frame.data_len = fread(resp_frame.payload, 1, bytes_to_read, f);
-
-                        ssp_udp_send_packet(&resp_frame);
-                        fclose(f);
-                    }
-                }
-                // ============== 处理【ACK 回执】 ==============
-                else if (frame->type == SSP_TYPE_ACK)
-                {
-                    g_last_acked_offset = frame->file_offset;
-#ifdef __linux__
-                    sem_post(&g_ack_sem);
-#else
-                    xSemaphoreGive(g_ack_sem);
-#endif
                 }
             }
             else
@@ -929,18 +819,28 @@ static void ssp_rx_task(void *arg)
 #endif
 }
 
-esp_err_t init_ssp_network(void)
-{
+esp_err_t init_ssp_network(void) {
+    // 绑定 KCP 内存分配钩子
+    ikcp_allocator(kcp_malloc, kcp_free);
+
 #ifdef __linux__
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, ssp_rx_thread, NULL) != 0)
-    {
+    pthread_t tid_rx, tid_kcp;
+    if (pthread_create(&tid_rx, NULL, ssp_rx_thread, NULL) != 0) {
         ESP_LOGE(TAG, "创建 Linux 接收线程失败");
         return ESP_FAIL;
     }
-    pthread_detach(tid);
+    pthread_detach(tid_rx); 
+    
+    // [新增] 启动 KCP 驱动线程
+    if (pthread_create(&tid_kcp, NULL, kcp_update_thread, NULL) != 0) {
+        ESP_LOGE(TAG, "创建 KCP 时钟线程失败");
+        return ESP_FAIL;
+    }
+    pthread_detach(tid_kcp);
 #else
     xTaskCreate(ssp_rx_task, "ssp_rx_task", 8192, NULL, 5, NULL);
+    // [新增] 启动 KCP 驱动任务
+    xTaskCreate(kcp_update_task, "kcp_update", 8192, NULL, 5, NULL);
 #endif
     return ESP_OK;
 }

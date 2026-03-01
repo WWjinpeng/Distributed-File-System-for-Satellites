@@ -3,7 +3,8 @@
 CC = gcc
 CFLAGS = -I../main -D__linux__  # 关键：定义 __linux__ 宏
 
-SRCS = ../main/main.c ../main/dist_vfs.c
+SRCS = ../main/main.c ../main/dist_vfs.c ../main/ikcp.c
+
 TARGET = sate_dfs_sim
 
 all:
